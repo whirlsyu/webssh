@@ -1,18 +1,26 @@
-FROM python:3-alpine
+FROM ubuntu:22.04
 
-LABEL maintainer='<author>'
-LABEL version='0.0.0-dev.0-build.0'
+# 1. 安装并配置SSH
+RUN apt-get update && \
+    apt-get install -y openssh-server sudo nano && \
+    mkdir -p /var/run/sshd && \
+    ssh-keygen -A && \ 
+    chmod 600 /etc/ssh/ssh_host_* && \  
+    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-ADD . /code
-WORKDIR /code
-RUN \
-  apk add --no-cache libc-dev libffi-dev gcc && \
-  pip install -r requirements.txt --no-cache-dir && \
-  apk del gcc libc-dev libffi-dev && \
-  addgroup webssh && \
-  adduser -Ss /bin/false -g webssh webssh && \
-  chown -R webssh:webssh /code
+# 2. 设置root密码
+#RUN echo 'root:pa3ss12_run_on!cewo9rd' | chpasswd
 
-EXPOSE 8888/tcp
-USER webssh
-CMD ["python", "run.py"]
+# 3. 创建普通用户并授予sudo权限
+RUN useradd -m -s /bin/bash genelibs && \
+    echo 'genelibs:genelibs' | chpasswd 
+#    echo 'genelibs ALL=(ALL) NOPASSWD: /usr/sbin/sshd' >> /etc/sudoers
+
+# 4. 切换用户后通过sudo启动SSH
+USER root
+WORKDIR /home/genelibs
+EXPOSE 22
+
+# 关键修改：使用sudo运行sshd
+CMD ["/usr/sbin/sshd", "-D"]

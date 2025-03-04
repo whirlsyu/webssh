@@ -6,10 +6,8 @@ try:
 except ImportError:
     UnicodeType = str
 
-try:
-    from urllib.parse import urlparse
-except ImportError:
-    from urlparse import urlparse
+from urllib.parse import urlparse
+
 
 
 numeric = re.compile(r'[0-9]+$')

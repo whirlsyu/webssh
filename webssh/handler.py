@@ -7,6 +7,9 @@ import traceback
 import weakref
 import paramiko
 import tornado.web
+import docker
+import uuid
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
@@ -24,10 +27,9 @@ try:
 except ImportError:
     JSONDecodeError = ValueError
 
-try:
-    from urllib.parse import urlparse
-except ImportError:
-    from urlparse import urlparse
+
+from urllib.parse import urlparse
+
 
 
 DEFAULT_PORT = 22
@@ -35,6 +37,43 @@ DEFAULT_PORT = 22
 swallow_http_errors = True
 redirecting = None
 
+def check_ssh_keys(container, timeout=30):
+    """检查容器SSH密钥是否生成"""
+    start = time.time()
+    required_keys = [
+        '/etc/ssh/ssh_host_rsa_key',
+        '/etc/ssh/ssh_host_ecdsa_key', 
+        '/etc/ssh/ssh_host_ed25519_key'
+    ]
+    
+    while time.time() - start < timeout:
+        try:
+            # 执行检查命令
+            exit_code, output = container.exec_run(f"ls {' '.join(required_keys)}")
+            
+            if exit_code == 0:
+                logging.debug("所有SSH密钥文件已存在")
+                return True
+                
+            # 记录详细错误信息
+            missing = []
+            for key in required_keys:
+                ec, _ = container.exec_run(f"ls {key}")
+                if ec != 0:
+                    missing.append(key)
+                    
+            logging.warning(f"缺失的密钥文件：{missing}")
+            
+        except docker.errors.APIError as e:
+            logging.error(f"Docker API错误：{str(e)}")
+            if "is not running" in str(e):
+                logging.error("容器已停止，无法检查密钥")
+                return False
+                
+        time.sleep(1)
+        
+    logging.error(f"SSH密钥检查超时（{timeout}秒）")
+    return False
 
 class InvalidValueError(Exception):
     pass
@@ -324,6 +363,15 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         self.debug = self.settings.get('debug', False)
         self.font = self.settings.get('font', '')
         self.result = dict(id=None, status=None, encoding=None)
+        self.conteiner = None
+        self.dockerargs = docker_args = {
+                                            "image": "ssh-enabled:latest",
+                                            #"command": "/bin/bash",
+                                            "auto_remove": True,
+                                            #"volumes": {"/host/path": {"bind": "/container/path", "mode": "rw"}},
+                                            "ports":{'22/tcp': 2222},     # 映射宿主机2222端口到容器22端口[1](@ref)
+                                            #"environment": {"ENV_VAR": "value"}
+                                        }
 
     def write_error(self, status_code, **kwargs):
         if swallow_http_errors and self.request.method == 'POST':
@@ -446,13 +494,134 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         logging.warning('Could not detect the default encoding.')
         return 'utf-8'
 
+    def docker(self, docker_args):
+        """创建一个Docker容器并返回DockerWorker对象"""
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            logging.error(f'连接Docker失败: {str(e)}')
+            raise ValueError(f'连接Docker失败: {str(e)}')
+        
+        # 获取Docker参数
+        image = docker_args.get('image')
+        container_name = docker_args.get('name')
+        
+        # 为容器生成唯一名称，避免冲突
+        if not container_name:
+            container_name = f'webssh_{uuid.uuid4().hex[:8]}'
+        else:
+            # 如果指定了名称，则添加随机后缀以避免冲突
+            container_name = f'{container_name}_{uuid.uuid4().hex[:6]}'
+        
+        docker_args["ports"]["22/tcp"] = int(self.get_value('port')) # 将宿主机端口映射到容器端口   
+        #cmd = docker_args.get('cmd') or '/bin/bash'
+        cmd = docker_args.get('cmd') or None
+        working_dir = docker_args.get('working_dir')
+        volumes = docker_args.get('volumes') or []
+        #ports = docker_args.get('ports') or {}
+        #ports = self.get_value('port') or {}
+        environment = docker_args.get('environment') or {}
+        
+        # 检查容器名称是否存在，如果存在则移除
+        try:
+            existing_container = client.containers.get(container_name)
+            logging.info(f'找到同名容器，正在移除: {container_name}')
+            existing_container.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        except Exception as e:
+            logging.error(f'移除已存在容器时出错: {str(e)}')
+            # 如果无法移除已存在容器，生成一个新的随机名称
+            container_name = f'webssh_{uuid.uuid4().hex}'
+            logging.info(f'生成新的容器名称: {container_name}')
+        
+        max_retries = 20
+        base_port = docker_args["ports"]["22/tcp"]
+        current_port = base_port
+        
+        for attempt in range(max_retries):
+            try:
+                docker_args["ports"]["22/tcp"] = current_port
+                logging.info(f'创建Docker容器: 镜像={image}, 命令={cmd}, 名称={container_name}')
+                
+                self.container = client.containers.run(
+                    image=image,
+                    command=cmd,
+                    name=container_name,
+                    working_dir=working_dir,
+                    volumes=volumes,
+                    ports=docker_args["ports"],  # 使用动态端口
+                    environment=environment,
+                    detach=True,
+                    tty=True,
+                    stdin_open=True,
+                    remove=False,
+                    privileged=True  # 可选：启用特权模式
+                )
+                if not check_ssh_keys(self.container):
+                    self.container.remove(force=True)
+                    raise RuntimeError("SSH密钥生成失败，已清理容器")
+
+                # 同时添加容器日志检查
+                logs = self.container.logs().decode()
+                if "Server listening on" not in logs:
+                    logging.error("SSHD未正确启动，容器日志：%s", logs)
+                                
+                times = 0
+                while not self.is_port_open('localhost', docker_args["ports"]["22/tcp"]) and times < 10:
+                    logging.info(f'等待容器启动: {container_name}:{docker_args["ports"]["22/tcp"]}')
+                    times += 1
+                    time.sleep(1)
+                
+                # 检查容器是否正在运行
+                #self.container.reload()
+                if self.container.status != 'running' and self.container.status != 'created':
+                    logging.error(f'容器未能正常启动，状态为: {self.container.status}')
+                    raise ValueError(f'容器未能正常启动，状态为: {self.container.status}')
+                else:
+                    break
+                
+            except Exception as e:
+                logging.error(f'创建Docker容器失败: {str(e)}')
+                if 'port is already allocated' in str(e).lower():
+                    logging.warning(f'端口 {current_port} 被占用，尝试端口 {current_port + 1}')
+                    existing_container = client.containers.get(container_name)
+                    logging.info(f'找到失败容器，正在移除: {container_name}')
+                    existing_container.remove(force=True)
+                    current_port += 1
+                    continue
+                else:                
+                    try:
+                        if 'container' in locals():
+                            self.container.remove(force=True)
+                    except:
+                        pass
+                    raise ValueError(f'创建Docker容器失败: {str(e)}')
+        else:
+            raise ValueError(f"连续 {max_retries} 次端口尝试失败")
+        
+        return (container_name, current_port)
+            
+
+    def is_port_open(self, host, port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)  # 设置1秒超时
+            return s.connect_ex((host, port)) == 0
     def ssh_connect(self, args):
         ssh = self.ssh_client
         dst_addr = args[:2]
-        logging.info('Connecting to {}:{}'.format(*dst_addr))
+        if args[0] == 'localhost':
+            try:
+                container_name, current_port =  self.docker(self.dockerargs)
+                temp_list = list(args)
+                temp_list[1] = current_port
+                argsn = tuple(temp_list)
+            except Exception as e:
+                raise ValueError(f'创建Docker容器失败: {str(e)}')
+            logging.info('Connecting to {}:{}'.format(*dst_addr))
 
-        try:
-            ssh.connect(*args, timeout=options.timeout)
+        try:            
+            ssh.connect(*argsn, timeout=options.timeout)
         except socket.error:
             raise ValueError('Unable to connect to {}:{}'.format(*dst_addr))
         except paramiko.BadAuthenticationType:
@@ -465,7 +634,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         term = self.get_argument('term', u'') or u'xterm'
         chan = ssh.invoke_shell(term=term)
         chan.setblocking(0)
-        worker = Worker(self.loop, ssh, chan, dst_addr)
+        worker = Worker(self.loop, ssh, chan, dst_addr,self.container)
         worker.encoding = options.encoding if options.encoding else \
             self.get_default_encoding(ssh)
         return worker

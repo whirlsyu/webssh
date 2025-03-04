@@ -1,4 +1,5 @@
 import logging
+import docker
 try:
     import secrets
 except ImportError:
@@ -35,7 +36,7 @@ def recycle_worker(worker):
 
 
 class Worker(object):
-    def __init__(self, loop, ssh, chan, dst_addr):
+    def __init__(self, loop, ssh, chan, dst_addr, container):
         self.loop = loop
         self.ssh = ssh
         self.chan = chan
@@ -46,6 +47,7 @@ class Worker(object):
         self.handler = None
         self.mode = IOLoop.READ
         self.closed = False
+        self.container = container
 
     def __call__(self, fd, events):
         if events & IOLoop.READ:
@@ -81,6 +83,7 @@ class Worker(object):
         else:
             logging.debug('{!r} from {}:{}'.format(data, *self.dst_addr))
             if not data:
+                self.try_remove_docker()
                 self.close(reason='chan closed')
                 return
 
@@ -119,7 +122,6 @@ class Worker(object):
         if self.closed:
             return
         self.closed = True
-
         logging.info(
             'Closing worker {} with reason: {}'.format(self.id, reason)
         )
@@ -128,7 +130,14 @@ class Worker(object):
             self.handler.close(reason=reason)
         self.chan.close()
         self.ssh.close()
+        self.try_remove_docker()
         logging.info('Connection to {}:{} lost'.format(*self.dst_addr))
 
         clear_worker(self, clients)
         logging.debug(clients)
+
+    def try_remove_docker(self):
+        try:
+            self.container.remove(force=True)
+        except Exception as e:
+            logging.error(f'移除已存在容器时出错: {str(e)}')        
